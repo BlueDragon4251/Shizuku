@@ -428,29 +428,37 @@ public class ShizukuService extends Service<ShizukuUserServiceManager, ShizukuCl
         }
 
         for (int user : users) {
-            for (PackageInfo pi : PackageManagerApis.getInstalledPackagesNoThrow(PackageManager.GET_META_DATA | PackageManager.GET_PERMISSIONS, user)) {
-                if (Objects.equals(MANAGER_APPLICATION_ID, pi.packageName)) continue;
-                if (pi.applicationInfo == null) continue;
+            int scanned = 0;
+            int matched = 0;
+            try {
+                for (PackageInfo pi : PackageManagerApis.getInstalledPackagesNoThrow(
+                        PackageManager.GET_META_DATA | PackageManager.GET_PERMISSIONS, user)) {
+                    scanned++;
+                    if (pi == null || Objects.equals(MANAGER_APPLICATION_ID, pi.packageName)) continue;
+                    if (pi.applicationInfo == null) continue;
 
-                int uid = pi.applicationInfo.uid;
-                int flags = 0;
-                ShizukuConfig.PackageEntry entry = configManager.find(uid);
-                if (entry != null) {
-                    if (entry.packages != null && !entry.packages.contains(pi.packageName))
-                        continue;
-                    flags = entry.flags & ConfigManager.MASK_PERMISSION;
-                }
+                    int uid = pi.applicationInfo.uid;
+                    int flags = 0;
+                    ShizukuConfig.PackageEntry entry = configManager.find(uid);
+                    if (entry != null) {
+                        if (entry.packages != null && !entry.packages.contains(pi.packageName))
+                            continue;
+                        flags = entry.flags & ConfigManager.MASK_PERMISSION;
+                    }
 
-                if (flags != 0) {
-                    list.add(pi);
-                } else if (pi.applicationInfo.metaData != null
-                        && pi.applicationInfo.metaData.getBoolean("moe.shizuku.client.V3_SUPPORT", false)
-                        && pi.requestedPermissions != null
-                        && ArraysKt.contains(pi.requestedPermissions, PERMISSION)) {
-                    list.add(pi);
+                    // Older clients can declare API_V23 without V3_SUPPORT metadata.
+                    // Listing a client does not grant it permission or bypass server checks.
+                    boolean requestsApi = pi.requestedPermissions != null
+                            && ArraysKt.contains(pi.requestedPermissions, PERMISSION);
+                    if (flags != 0 || requestsApi) {
+                        list.add(pi);
+                        matched++;
+                    }
                 }
+            } catch (Throwable tr) {
+                LOGGER.e(tr, "getApplications failed for user %d", user);
             }
-
+            LOGGER.i("getApplications user %d: scanned=%d matched=%d", user, scanned, matched);
         }
         return new ParcelableListSlice<>(list);
     }
