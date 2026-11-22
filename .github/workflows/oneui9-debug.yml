@@ -27,12 +27,15 @@ jobs:
           java-version: '21'
           cache: gradle
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
+      # ubuntu-latest already has Android command-line tools installed.
+      # setup-android@v3 tries to install obsolete package 'tools' and fails.
       - name: Install Android SDK 36 and NDK
+        shell: bash
         run: |
-          sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;29.0.13113456"
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-36" "build-tools;36.0.0" "ndk;29.0.13113456"
+          echo 'android.sdk.channel=3' >> gradle.properties
 
       - name: Build manager debug APK
         run: |
