@@ -6,6 +6,7 @@ import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.os.Build;
 import android.util.AtomicFile;
+import android.util.Log;
 
 import androidx.annotation.Nullable;
 
@@ -24,9 +25,9 @@ import java.util.List;
 import java.util.Set;
 
 import kotlin.collections.ArraysKt;
+import moe.shizuku.common.util.DiscoveryCompat;
 import rikka.hidden.compat.PackageManagerApis;
 import rikka.hidden.compat.PermissionManagerApis;
-import rikka.hidden.compat.UserManagerApis;
 import rikka.shizuku.server.ktx.HandlerKt;
 
 public class ShizukuConfigManager extends ConfigManager {
@@ -148,30 +149,43 @@ public class ShizukuConfigManager extends ConfigManager {
             }
         }
 
-        for (int userId : UserManagerApis.getUserIdsNoThrow()) {
-            for (PackageInfo pi : PackageManagerApis.getInstalledPackagesNoThrow(PackageManager.GET_PERMISSIONS, userId)) {
-                if (pi == null
-                        || pi.applicationInfo == null
-                        || pi.requestedPermissions == null
-                        || !ArraysKt.contains(pi.requestedPermissions, PERMISSION)) {
-                    continue;
+        for (int userId : ShizukuService.getDiscoveryUserIds("config import")) {
+            int clients = 0;
+            int grants = 0;
+            try {
+                List<PackageInfo> installed = DiscoveryCompat.getInstalledPackages(PackageManager.GET_PERMISSIONS, userId);
+                Log.i(ShizukuService.DISCOVERY_TAG, "config import user=" + userId + " packages=" + installed.size());
+                for (PackageInfo pi : installed) {
+                    if (pi == null
+                            || pi.applicationInfo == null
+                            || pi.requestedPermissions == null
+                            || !ArraysKt.contains(pi.requestedPermissions, PERMISSION)) {
+                        continue;
+                    }
+
+                    clients++;
+                    int uid = pi.applicationInfo.uid;
+                    boolean allowed;
+                    try {
+                        allowed = PermissionManagerApis.checkPermission(PERMISSION, uid) == PackageManager.PERMISSION_GRANTED;
+                    } catch (Throwable e) {
+                        Log.e(ShizukuService.DISCOVERY_TAG, "config permission check failed user=" + userId
+                                + " client=" + pi.packageName + " uid=" + uid, e);
+                        continue;
+                    }
+                    if (allowed) grants++;
+
+                    List<String> packages = new ArrayList<>();
+                    packages.add(pi.packageName);
+
+                    updateLocked(uid, packages, ConfigManager.MASK_PERMISSION, allowed ? ConfigManager.FLAG_ALLOWED : 0);
+                    changed = true;
                 }
-
-                int uid = pi.applicationInfo.uid;
-                boolean allowed;
-                try {
-                    allowed = PermissionManagerApis.checkPermission(PERMISSION, uid) == PackageManager.PERMISSION_GRANTED;
-                } catch (Throwable e) {
-                    LOGGER.w("checkPermission");
-                    continue;
-                }
-
-                List<String> packages = new ArrayList<>();
-                packages.add(pi.packageName);
-
-                updateLocked(uid, packages, ConfigManager.MASK_PERMISSION, allowed ? ConfigManager.FLAG_ALLOWED : 0);
-                changed = true;
+            } catch (Throwable tr) {
+                Log.e(ShizukuService.DISCOVERY_TAG, "config import failed user=" + userId, tr);
             }
+            Log.i(ShizukuService.DISCOVERY_TAG, "config import complete user=" + userId
+                    + " clients=" + clients + " granted=" + grants);
         }
 
         if (changed) {

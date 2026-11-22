@@ -1,6 +1,7 @@
 package moe.shizuku.manager.management;
 
 import android.content.pm.PackageInfo;
+import android.util.Log;
 
 import java.util.List;
 
@@ -28,6 +29,8 @@ public class AppsAdapter extends BaseRecyclerViewAdapter<ClassCreatorPool> {
     }
 
     public void updateData(List<PackageInfo> data) {
+        Log.i("ShizukuDiscovery", "adapter update packages=" + data.size()
+                + " emptyPlaceholder=" + data.isEmpty());
         getItems().clear();
         if (data.isEmpty()) {
             getItems().add(new Object());
@@ -35,5 +38,6 @@ public class AppsAdapter extends BaseRecyclerViewAdapter<ClassCreatorPool> {
             getItems().addAll(data);
         }
         notifyDataSetChanged();
+        Log.i("ShizukuDiscovery", "adapter renderedItems=" + getItemCount());
     }
 }

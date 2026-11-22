@@ -23,6 +23,7 @@ import android.content.pm.PackageManager;
 import android.content.pm.UserInfo;
 import android.ddm.DdmHandleAppName;
 import android.os.Binder;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
@@ -30,18 +31,23 @@ import android.os.Looper;
 import android.os.Parcel;
 import android.os.RemoteException;
 import android.os.ServiceManager;
+import android.os.SystemClock;
 import android.util.Log;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import kotlin.collections.ArraysKt;
 import moe.shizuku.api.BinderContainer;
 import moe.shizuku.common.util.BuildUtils;
+import moe.shizuku.common.util.DiscoveryCompat;
 import moe.shizuku.common.util.OsUtils;
 import moe.shizuku.server.IShizukuApplication;
 import rikka.hidden.compat.ActivityManagerApis;
@@ -58,8 +64,18 @@ import rikka.shizuku.server.util.UserHandleCompat;
 
 public class ShizukuService extends Service<ShizukuUserServiceManager, ShizukuClientManager, ShizukuConfigManager> {
 
+    static final String DISCOVERY_TAG = "ShizukuDiscovery";
+    // This marker belongs to the running server code, not the installed manager APK.
+    private static final String DISCOVERY_REVISION = "android17-discovery-v2";
+    private static final AtomicInteger discoveryRequests = new AtomicInteger();
+
     public static void main(String[] args) {
         DdmHandleAppName.setAppName("shizuku_server", 0);
+        Log.i(DISCOVERY_TAG, "server start revision=" + DISCOVERY_REVISION
+                + " pid=" + android.os.Process.myPid() + " uid=" + android.os.Process.myUid()
+                + " sdk=" + Build.VERSION.SDK_INT + " preview=" + Build.VERSION.PREVIEW_SDK_INT
+                + " release=" + Build.VERSION.RELEASE + " codename=" + Build.VERSION.CODENAME
+                + " manufacturer=" + Build.MANUFACTURER + " model=" + Build.MODEL);
         RishConfig.setLibraryPath(System.getProperty("shizuku.library.path"));
 
         Looper.prepareMainLooper();
@@ -108,6 +124,8 @@ public class ShizukuService extends Service<ShizukuUserServiceManager, ShizukuCl
 
         assert ai != null;
         managerAppId = ai.uid;
+        Log.i(DISCOVERY_TAG, "server manager package=" + MANAGER_APPLICATION_ID
+                + " uid=" + managerAppId + " source=" + ai.sourceDir);
 
         configManager = getConfigManager();
         clientManager = getClientManager();
@@ -418,48 +436,104 @@ public class ShizukuService extends Service<ShizukuUserServiceManager, ShizukuCl
         getUserServiceManager().removeUserServicesForPackage(packageName);
     }
 
-    private ParcelableListSlice<PackageInfo> getApplications(int userId) {
+    static List<Integer> getDiscoveryUserIds(String stage) {
+        Set<Integer> users = new LinkedHashSet<>();
+        // Shizuku's manager must be installed in owner user 0. Keep that known
+        // user available even if the OEM's user enumeration is restricted.
+        users.add(0);
+        try {
+            for (UserInfo user : DiscoveryCompat.getUsers(true)) {
+                if (user != null) users.add(user.id);
+            }
+        } catch (Throwable tr) {
+            Log.e(DISCOVERY_TAG, stage + " user enumeration failed; using owner user 0", tr);
+        }
+        Log.i(DISCOVERY_TAG, stage + " users=" + users);
+        return new ArrayList<>(users);
+    }
+
+    private ParcelableListSlice<PackageInfo> getApplications(int userId, int request) {
+        long started = SystemClock.elapsedRealtime();
         List<PackageInfo> list = new ArrayList<>();
         List<Integer> users = new ArrayList<>();
         if (userId == -1) {
-            users.addAll(UserManagerApis.getUserIdsNoThrow());
+            users.addAll(getDiscoveryUserIds("request=" + request));
         } else {
+            if (userId < 0) throw new IllegalArgumentException("Invalid user " + userId);
             users.add(userId);
         }
 
+        int successfulUsers = 0;
+        int failedUsers = 0;
+        Throwable firstFailure = null;
         for (int user : users) {
             int scanned = 0;
             int matched = 0;
+            int apiClients = 0;
+            int missingApplicationInfo = 0;
+            int configMismatch = 0;
+            boolean succeeded = false;
             try {
-                for (PackageInfo pi : PackageManagerApis.getInstalledPackagesNoThrow(
-                        PackageManager.GET_META_DATA | PackageManager.GET_PERMISSIONS, user)) {
+                List<PackageInfo> installed = DiscoveryCompat.getInstalledPackages(
+                        PackageManager.GET_META_DATA | PackageManager.GET_PERMISSIONS, user);
+                for (PackageInfo pi : installed) {
                     scanned++;
                     if (pi == null || Objects.equals(MANAGER_APPLICATION_ID, pi.packageName)) continue;
-                    if (pi.applicationInfo == null) continue;
+
+                    boolean requestsApi = pi.requestedPermissions != null
+                            && ArraysKt.contains(pi.requestedPermissions, PERMISSION);
+                    if (requestsApi) apiClients++;
+                    if (pi.applicationInfo == null) {
+                        missingApplicationInfo++;
+                        if (requestsApi) Log.w(DISCOVERY_TAG, "request=" + request + " user=" + user
+                                + " client=" + pi.packageName + " excluded=missingApplicationInfo");
+                        continue;
+                    }
 
                     int uid = pi.applicationInfo.uid;
                     int flags = 0;
                     ShizukuConfig.PackageEntry entry = configManager.find(uid);
                     if (entry != null) {
-                        if (entry.packages != null && !entry.packages.contains(pi.packageName))
+                        if (entry.packages != null && !entry.packages.contains(pi.packageName)) {
+                            configMismatch++;
+                            if (requestsApi) Log.w(DISCOVERY_TAG, "request=" + request + " user=" + user
+                                    + " client=" + pi.packageName + " uid=" + uid + " excluded=configMismatch");
                             continue;
+                        }
                         flags = entry.flags & ConfigManager.MASK_PERMISSION;
                     }
 
                     // Older clients can declare API_V23 without V3_SUPPORT metadata.
                     // Listing a client does not grant it permission or bypass server checks.
-                    boolean requestsApi = pi.requestedPermissions != null
-                            && ArraysKt.contains(pi.requestedPermissions, PERMISSION);
                     if (flags != 0 || requestsApi) {
                         list.add(pi);
                         matched++;
+                        boolean v3 = pi.applicationInfo.metaData != null
+                                && pi.applicationInfo.metaData.getBoolean("moe.shizuku.client.V3_SUPPORT", false);
+                        Log.i(DISCOVERY_TAG, "request=" + request + " user=" + user
+                                + " client=" + pi.packageName + " uid=" + uid
+                                + " apiV23=" + requestsApi + " v3Metadata=" + v3 + " configFlags=" + flags);
                     }
                 }
+                successfulUsers++;
+                succeeded = true;
             } catch (Throwable tr) {
-                LOGGER.e(tr, "getApplications failed for user %d", user);
+                failedUsers++;
+                if (firstFailure == null) firstFailure = tr;
+                Log.e(DISCOVERY_TAG, "request=" + request + " packages failed user=" + user, tr);
             }
-            LOGGER.i("getApplications user %d: scanned=%d matched=%d", user, scanned, matched);
+            Log.i(DISCOVERY_TAG, "request=" + request + " user=" + user + " success=" + succeeded
+                    + " scanned=" + scanned + " apiClients=" + apiClients + " selected=" + matched
+                    + " missingApplicationInfo=" + missingApplicationInfo + " configMismatch=" + configMismatch);
         }
+        if (successfulUsers == 0 && firstFailure != null) {
+            // A failed package query is not a successful, empty app list.
+            throw new IllegalStateException("Shizuku package discovery failed for all requested users; see "
+                    + DISCOVERY_TAG + " logs", firstFailure);
+        }
+        Log.i(DISCOVERY_TAG, "request=" + request + " complete packages=" + list.size()
+                + " successfulUsers=" + successfulUsers + " failedUsers=" + failedUsers
+                + " elapsedMs=" + (SystemClock.elapsedRealtime() - started));
         return new ParcelableListSlice<>(list);
     }
 
@@ -468,34 +542,52 @@ public class ShizukuService extends Service<ShizukuUserServiceManager, ShizukuCl
         //LOGGER.d("transact: code=%d, calling uid=%d", code, Binder.getCallingUid());
         if (code == ServerConstants.BINDER_TRANSACTION_getApplications) {
             data.enforceInterface(ShizukuApiConstants.BINDER_DESCRIPTOR);
+            enforceManagerPermission("getApplications");
             int userId = data.readInt();
-            ParcelableListSlice<PackageInfo> result = getApplications(userId);
-            reply.writeNoException();
-            result.writeToParcel(reply, android.os.Parcelable.PARCELABLE_WRITE_RETURN_VALUE);
-            return true;
+            int request = discoveryRequests.incrementAndGet();
+            Log.i(DISCOVERY_TAG, "request=" + request + " begin revision=" + DISCOVERY_REVISION
+                    + " requestedUser=" + userId + " callerUid=" + Binder.getCallingUid()
+                    + " callerPid=" + Binder.getCallingPid() + " serverUid=" + android.os.Process.myUid()
+                    + " serverPid=" + android.os.Process.myPid());
+            try {
+                ParcelableListSlice<PackageInfo> result = getApplications(userId, request);
+                reply.writeNoException();
+                result.writeToParcel(reply, android.os.Parcelable.PARCELABLE_WRITE_RETURN_VALUE);
+                Log.i(DISCOVERY_TAG, "request=" + request + " replyBytes=" + reply.dataSize());
+                return true;
+            } catch (RuntimeException tr) {
+                Log.e(DISCOVERY_TAG, "request=" + request + " failed before reply", tr);
+                throw tr;
+            }
         }
         return super.onTransact(code, data, reply, flags);
     }
 
     void sendBinderToClient() {
-        for (int userId : UserManagerApis.getUserIdsNoThrow()) {
+        for (int userId : getDiscoveryUserIds("sendBinderToClient")) {
             sendBinderToClient(this, userId);
         }
     }
 
     private static void sendBinderToClient(Binder binder, int userId) {
+        int clients = 0;
         try {
-            for (PackageInfo pi : PackageManagerApis.getInstalledPackagesNoThrow(PackageManager.GET_PERMISSIONS, userId)) {
+            List<PackageInfo> installed = DiscoveryCompat.getInstalledPackages(PackageManager.GET_PERMISSIONS, userId);
+            Log.i(DISCOVERY_TAG, "binder scan user=" + userId + " packages=" + installed.size());
+            for (PackageInfo pi : installed) {
                 if (pi == null || pi.requestedPermissions == null)
                     continue;
 
                 if (ArraysKt.contains(pi.requestedPermissions, PERMISSION)) {
+                    clients++;
+                    Log.i(DISCOVERY_TAG, "binder candidate user=" + userId + " client=" + pi.packageName);
                     sendBinderToUserApp(binder, pi.packageName, userId);
                 }
             }
         } catch (Throwable tr) {
-            LOGGER.e("exception when call getInstalledPackages", tr);
+            Log.e(DISCOVERY_TAG, "binder scan failed user=" + userId, tr);
         }
+        Log.i(DISCOVERY_TAG, "binder scan complete user=" + userId + " clients=" + clients);
     }
 
     void sendBinderToManager() {
@@ -503,7 +595,7 @@ public class ShizukuService extends Service<ShizukuUserServiceManager, ShizukuCl
     }
 
     private static void sendBinderToManger(Binder binder) {
-        for (int userId : UserManagerApis.getUserIdsNoThrow()) {
+        for (int userId : getDiscoveryUserIds("sendBinderToManager")) {
             sendBinderToManger(binder, userId);
         }
     }

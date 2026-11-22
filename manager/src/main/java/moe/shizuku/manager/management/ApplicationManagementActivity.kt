@@ -1,6 +1,7 @@
 package moe.shizuku.manager.management
 
 import android.os.Bundle
+import android.util.Log
 import android.util.TypedValue
 import android.view.MenuItem
 import android.widget.Toast
@@ -20,8 +21,10 @@ class ApplicationManagementActivity : AppBarActivity() {
 
     private val viewModel by appsViewModel()
     private val adapter = AppsAdapter()
+    private var hasResumed = false
 
     private val binderDeadListener = Shizuku.OnBinderDeadListener {
+        Log.w("ShizukuDiscovery", "ui binder died; closing application management")
         if (!isFinishing) {
             finish()
         }
@@ -30,7 +33,9 @@ class ApplicationManagementActivity : AppBarActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        if (!Shizuku.pingBinder()) {
+        val binderAlive = Shizuku.pingBinder()
+        Log.i("ShizukuDiscovery", "ui create binderAlive=$binderAlive restored=${savedInstanceState != null} cachedStatus=${viewModel.packages.value?.status}")
+        if (!binderAlive) {
             finish()
             return
         }
@@ -41,6 +46,7 @@ class ApplicationManagementActivity : AppBarActivity() {
         supportActionBar?.setDisplayHomeAsUpEnabled(true)
 
         viewModel.packages.observe(this) {
+            Log.i("ShizukuDiscovery", "ui result status=${it.status} packages=${it.data?.size}")
             when (it.status) {
                 Status.SUCCESS -> {
                     adapter.updateData(it.data)
@@ -48,6 +54,7 @@ class ApplicationManagementActivity : AppBarActivity() {
                 Status.ERROR -> {
                     finish()
                     val tr = it.error
+                    Log.e("ShizukuDiscovery", "ui application list failed", tr)
                     Toast.makeText(this, Objects.toString(tr, "unknown"), Toast.LENGTH_SHORT).show()
                     tr.printStackTrace()
                 }
@@ -82,6 +89,12 @@ class ApplicationManagementActivity : AppBarActivity() {
 
     override fun onResume() {
         super.onResume()
+        Log.i("ShizukuDiscovery", "ui resume refresh=$hasResumed cachedStatus=${viewModel.packages.value?.status} adapterItems=${adapter.itemCount}")
         adapter.notifyDataSetChanged()
+        if (hasResumed) {
+            // Requery on return so an earlier empty list cannot remain cached forever.
+            viewModel.load()
+        }
+        hasResumed = true
     }
 }

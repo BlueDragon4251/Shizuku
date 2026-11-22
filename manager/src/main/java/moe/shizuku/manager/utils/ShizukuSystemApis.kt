@@ -2,11 +2,10 @@ package moe.shizuku.manager.utils
 
 import android.content.pm.PackageInfo
 import android.content.pm.PackageManager
-import android.content.pm.ParceledListSlice
 import android.os.RemoteException
-import rikka.hidden.compat.PackageManagerApis
+import android.util.Log
+import moe.shizuku.common.util.DiscoveryCompat
 import rikka.hidden.compat.PermissionManagerApis
-import rikka.hidden.compat.UserManagerApis
 import rikka.hidden.compat.util.SystemServiceBinder
 import rikka.shizuku.Shizuku
 import rikka.shizuku.ShizukuBinderWrapper
@@ -25,13 +24,19 @@ object ShizukuSystemApis {
         return if (!Shizuku.pingBinder()) {
             arrayListOf(UserInfoCompat(UserHandleCompat.myUserId(), "Owner"))
         } else try {
-            val list = UserManagerApis.getUsers(true, true, true)
+            val list = DiscoveryCompat.getUsers(true)
             val users: MutableList<UserInfoCompat> = ArrayList<UserInfoCompat>()
             for (ui in list) {
                 users.add(UserInfoCompat(ui.id, ui.name))
             }
+            if (users.isEmpty()) {
+                Log.w("ShizukuDiscovery", "manager user enumeration returned no users; using current user")
+                users.add(UserInfoCompat(UserHandleCompat.myUserId(), "Owner"))
+            }
+            Log.i("ShizukuDiscovery", "manager available users=${users.map { it.id }}")
             return users
         } catch (tr: Throwable) {
+            Log.e("ShizukuDiscovery", "manager user enumeration failed; using current user", tr)
             arrayListOf(UserInfoCompat(UserHandleCompat.myUserId(), "Owner"))
         }
     }
@@ -54,19 +59,12 @@ object ShizukuSystemApis {
     }
 
     fun getInstalledPackages(flags: Long, userId: Int): List<PackageInfo> {
-        return if (!Shizuku.pingBinder()) {
-            ArrayList()
-        } else try {
-            val listSlice: ParceledListSlice<PackageInfo>? =
-                PackageManagerApis.getInstalledPackages(
-                    flags,
-                    userId
-                )
-            return if (listSlice != null) {
-                listSlice.list
-            } else ArrayList()
-        } catch (tr: RemoteException) {
-            throw RuntimeException(tr.message, tr)
+        check(Shizuku.pingBinder()) { "Shizuku Binder is unavailable during package discovery" }
+        return try {
+            DiscoveryCompat.getInstalledPackages(flags, userId)
+        } catch (tr: Throwable) {
+            Log.e("ShizukuDiscovery", "manager package query failed user=$userId flags=$flags", tr)
+            throw tr
         }
     }
 
